@@ -4,35 +4,54 @@ class OfflineListening {
   static const MethodChannel _channel = MethodChannel('flutter_mfcc_plugin');
 
   /// Checks if the TensorFlow Lite model is loaded correctly.
-  /// Returns true if loaded successfully, false otherwise.
+  /// Returns `true` if the model is loaded successfully, `false` otherwise.
   static Future<bool> isModelLoaded(String modelPath) async {
-    final bool isLoaded = await _channel.invokeMethod(
-      'isModelLoaded',
-      {'modelPath': modelPath},
-    );
-    return isLoaded;
+    try {
+      final bool isLoaded = await _channel.invokeMethod(
+        'isModelLoaded',
+        {'modelPath': modelPath},
+      );
+      return isLoaded;
+    } on PlatformException catch (e) {
+      print("Error while checking if model is loaded: ${e.message}");
+      return false;
+    } catch (e) {
+      print("Unexpected error while checking if model is loaded: $e");
+      return false;
+    }
   }
 
-  /// Starts the listening service with models and their input shapes.
-  /// - `modelPaths`: List of paths to the TensorFlow Lite models.
-  /// - `shapes`: Corresponding input shapes for each model.
-  static Future<void> startListening(List<String> modelPaths, List<List<int>> shapes) async {
+  /// Starts the listening service with the provided TensorFlow Lite model.
+  ///
+  /// - [modelPath]: Path to the TensorFlow Lite model.
+  ///
+  /// This method initializes the wake word detection process using the
+  /// provided model. Make sure the model is valid by calling `isModelLoaded`
+  /// before invoking this method.
+  static Future<void> startListening(String modelPath) async {
     try {
       await _channel.invokeMethod('startListening', {
-        'modelPaths': modelPaths,
-        'shapes': shapes,
+        'modelPath': modelPath,
       });
+      print("Listening started successfully.");
     } on PlatformException catch (e) {
-      print("Error: ${e.message}");
+      print("Error while starting listening: ${e.message}");
+    } catch (e) {
+      print("Unexpected error while starting listening: $e");
     }
   }
 
   /// Stops the listening service.
+  ///
+  /// This method halts the wake word detection process and releases resources.
   static Future<void> stopListening() async {
     try {
       await _channel.invokeMethod('stopListening');
+      print("Listening stopped successfully.");
     } on PlatformException catch (e) {
-      print("Error: ${e.message}");
+      print("Error while stopping listening: ${e.message}");
+    } catch (e) {
+      print("Unexpected error while stopping listening: $e");
     }
   }
 }

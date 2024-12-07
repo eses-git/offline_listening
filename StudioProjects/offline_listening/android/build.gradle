@@ -65,14 +65,20 @@ dependencies {
     // Include all .jar files in the 'libs' directory
 
     // TensorFlow Lite for Android
-    implementation 'org.tensorflow:tensorflow-lite:2.12.0'
+    //implementation 'org.tensorflow:tensorflow-lite:2.16.1'
+    //implementation 'org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1'
+    //implementation 'org.tensorflow:tensorflow-lite-gpu:2.16.1'
+
+    //implementation 'org.bytedeco:tensorflow-lite:2.18.0-1.5.11'
+
+    implementation 'org.bytedeco:tensorflow-lite:2.18.0-1.5.11'
+
+
     //implementation 'org.openimaj:JTransforms:1.3.10'
    // implementation 'com.github.rwl:jtransforms:2.4.0'
     implementation 'com.github.wendykierp:JTransforms:3.1'
 
 
-    implementation 'org.tensorflow:tensorflow-lite-select-tf-ops:2.12.0'
-    implementation 'org.tensorflow:tensorflow-lite-gpu:2.12.0'
 
     // Kotlin Standard Library
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"

@@ -11,22 +11,22 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.tensorflow.lite.Interpreter
 import java.io.File
-import org.jtransforms.fft.FloatFFT_1D
 import kotlin.math.*
 
 const val SAMPLE_RATE = 16000
-const val N_MELS = 64
-const val FFT_SIZE = 512
-const val HOP_SIZE = 256
-const val N_FRAMES = 15
-val NUM_COEFFICIENTS = 13
+const val N_MELS = 40
+const val FRAME_RATE = 100
+const val FRAME_SIZE = SAMPLE_RATE / FRAME_RATE  // Samples per frame
+const val N_FRAMES = 100  // Number of time frames for TFLite model
+const val BUFFER_SIZE = FRAME_SIZE * N_FRAMES
+const val THRESHOLD = 0.5f  // Wake word detection confidence threshold
 
 class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var channel: MethodChannel
     private var audioRecord: AudioRecord? = null
     @Volatile
     private var isListening = false
-    private val interpreters = mutableListOf<Interpreter>()
+    private var interpreter: Interpreter? = null
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(binding.binaryMessenger, "flutter_mfcc_plugin")
@@ -35,8 +35,8 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         stopListening()
-        interpreters.forEach { it.close() }
-        interpreters.clear()
+        interpreter?.close()
+        interpreter = null
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -47,12 +47,11 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
 
             "startListening" -> {
-                val modelPaths = call.argument<List<String>>("modelPaths")
-                val shapes = call.argument<List<List<Int>>>("shapes") // Shape passed here
-                if (!modelPaths.isNullOrEmpty() && shapes != null && shapes.size == modelPaths.size) {
+                val modelPath = call.argument<String>("modelPath")
+                if (!modelPath.isNullOrEmpty()) {
                     CoroutineScope(Dispatchers.Main).launch {
                         try {
-                            startListeningWithModels(modelPaths, shapes)
+                            startListeningWithModel(modelPath)
                             result.success("Listening started")
                         } catch (e: Exception) {
                             stopListening()
@@ -60,7 +59,7 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                         }
                     }
                 } else {
-                    result.error("INVALID_ARGUMENT", "Model paths or shapes are null or invalid", null)
+                    result.error("INVALID_ARGUMENT", "Model path is null or invalid", null)
                 }
             }
 
@@ -73,89 +72,23 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
     }
 
-    fun extractMFCC(audioBuffer: ShortArray): Array<Array<Array<FloatArray>>> {
-        val audioFloat = audioBuffer.map { it.toFloat() / Short.MAX_VALUE.toFloat() }
-        val frequencyData = applyFFT(audioFloat)
-        val melSpectrogram = melFilterBank(frequencyData)
-        val mfcc = computeMFCC(melSpectrogram)
-        return arrayOf(arrayOf(mfcc))
-    }
-
-    fun applyFFT(audio: List<Float>): Array<FloatArray> {
-        val signal = FloatArray(audio.size)
-        val fft = FloatFFT_1D(signal.size.toLong())
-        fft.realForward(signal)
-        val realPart = FloatArray(signal.size / 2)
-        val imaginaryPart = FloatArray(signal.size / 2)
-
-        for (i in 0 until signal.size / 2) {
-            realPart[i] = signal[i * 2]
-            imaginaryPart[i] = signal[i * 2 + 1]
-        }
-
-        return Array(realPart.size) { i -> floatArrayOf(realPart[i], imaginaryPart[i]) }
-    }
-
-    fun melFilterBank(frequencyData: Array<FloatArray>): Array<FloatArray> {
-        val melData = Array(N_MELS) { FloatArray(frequencyData.size) }
-        val melMin = 300.0
-        val melMax = 8000.0
-        val melScale = Array(N_MELS) { 0f }
-
-        for (i in 0 until N_MELS) {
-            val melValue = melMin + (i.toDouble() * (melMax - melMin) / (N_MELS - 1))
-            val logValue = 1 + melValue
-            val logResult = log10(logValue.toFloat()) / 700
-            melScale[i] = (2595 * logResult).toFloat()
-        }
-
-        for (i in 0 until N_MELS) {
-            for (j in 0 until frequencyData.size) {
-                melData[i][j] = frequencyData[j][0] * melScale[i]
-            }
-        }
-
-        return melData
-    }
-
-    fun computeMFCC(melSpectrogram: Array<FloatArray>): Array<FloatArray> {
-        val mfcc = Array(melSpectrogram.size) { FloatArray(NUM_COEFFICIENTS) }
-        for (i in melSpectrogram.indices) {
-            for (j in 0 until NUM_COEFFICIENTS) {
-                var sum = 0f
-                for (k in melSpectrogram[i].indices) {
-                    sum += melSpectrogram[i][k] * cos(Math.PI * (j.toFloat() + 0.5) * k / melSpectrogram[i].size).toFloat()
-                }
-                mfcc[i][j] = sum
-            }
-        }
-        return mfcc
-    }
-
     private fun isModelLoaded(modelPath: String): Boolean {
-        return try {
-            Interpreter(File(modelPath)).close()
-            true
-        } catch (e: Exception) {
-            false
-        }
+        println("Received modelPath: $modelPath")
+        val file = File(modelPath)
+        println("File exists: ${file.exists()}")
+        return file.exists()
     }
 
-    private fun startListeningWithModels(modelPaths: List<String>, shapes: List<List<Int>>) {
-        interpreters.clear()
-        modelPaths.forEachIndexed { index, modelPath ->
-            val interpreter = loadModelFromPath(modelPath)
-            validateModel(interpreter, shapes[index])  // Pass shape information here
-            interpreters.add(interpreter)
-        }
+    private fun startListeningWithModel(modelPath: String) {
+        interpreter = loadModelFromPath(modelPath)
+        validateModel(interpreter!!)
 
-        val bufferSize = AudioRecord.getMinBufferSize(
+        val minBufferSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-
-        if (bufferSize == AudioRecord.ERROR_BAD_VALUE || bufferSize == AudioRecord.ERROR) {
+        if (minBufferSize == AudioRecord.ERROR_BAD_VALUE || minBufferSize == AudioRecord.ERROR) {
             throw IllegalStateException("Invalid AudioRecord buffer size")
         }
 
@@ -164,27 +97,38 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
+            BUFFER_SIZE
         )
 
         isListening = true
         audioRecord?.startRecording()
 
         CoroutineScope(Dispatchers.IO).launch {
-            processAudio(bufferSize)
+            processAudio()
         }
     }
 
-    private suspend fun processAudio(bufferSize: Int) {
-        val audioBuffer = ShortArray(bufferSize)
+    private suspend fun processAudio() {
+        val audioBuffer = ShortArray(BUFFER_SIZE)
+        val slidingWindow = ArrayDeque<Short>()  // To hold continuous audio data
         try {
             while (isListening) {
                 val read = audioRecord?.read(audioBuffer, 0, audioBuffer.size) ?: 0
                 if (read > 0) {
-                    val mfccFeatures = extractMFCC(audioBuffer)
-                    interpreters.forEachIndexed { index, interpreter ->
-                        if (detectWakeWord(interpreter, mfccFeatures)) {
-                            println("Wake Word detected by model $index!")
+                    // Add new audio samples to the sliding window
+                    slidingWindow.addAll(audioBuffer.take(read))
+                    if (slidingWindow.size >= BUFFER_SIZE) {
+                        // Process the audio if we have enough data
+                        val mfccFeatures = extractMFCC(slidingWindow.take(BUFFER_SIZE).toShortArray())
+                        repeat(BUFFER_SIZE) {
+                            if (slidingWindow.isNotEmpty()) {
+                                slidingWindow.removeFirst()
+                            }
+                        }
+
+                        // Run inference
+                        if (detectWakeWord(interpreter!!, mfccFeatures)) {
+                            println("Wake Word detected!")
                         }
                     }
                 }
@@ -207,28 +151,87 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         return Interpreter(file)
     }
 
-    private fun validateModel(interpreter: Interpreter, expectedShape: List<Int>) {
-        val inputShape = interpreter.getInputTensor(0).shape().toList()
-        val outputShape = interpreter.getOutputTensor(0).shape().toList()
+    private fun validateModel(interpreter: Interpreter) {
+        // Get input and output tensor details
+        val inputTensor = interpreter.getInputTensor(0)
+        val outputTensor = interpreter.getOutputTensor(0)
 
-        require(inputShape == expectedShape) {
-            "Model input shape $inputShape does not match expected shape $expectedShape"
+        val inputShape = inputTensor.shape()
+        val outputShape = outputTensor.shape()
+
+        // Log all details for debugging
+        println("Model Validation Debugging:")
+        println("Expected Input Shape: [1, $N_FRAMES, $N_MELS, 1]")
+        println("Actual Input Shape: ${inputShape.contentToString()}")
+        println("Input Tensor Details: Name=${inputTensor.name()}, Dtype=${inputTensor.dataType()}, Shape=${inputShape.contentToString()}")
+
+        println("Expected Output Shape: [1, 1]")
+        println("Actual Output Shape: ${outputShape.contentToString()}")
+        println("Output Tensor Details: Name=${outputTensor.name()}, Dtype=${outputTensor.dataType()}, Shape=${outputShape.contentToString()}")
+
+        // Validate input shape
+        require(inputShape.contentEquals(intArrayOf(1, N_FRAMES, N_MELS, 1))) {
+            "Model input shape must be [1, $N_FRAMES, $N_MELS, 1], but found ${inputShape.contentToString()}"
         }
-        require(outputShape.size == 2) {
-            "Model output shape must be [batch_size, classes], but was $outputShape"
+
+        // Validate output shape
+        require(outputShape.contentEquals(intArrayOf(1, 1))) {
+            "Model output shape must be [1, 1], but found ${outputShape.contentToString()}"
         }
     }
 
-    private fun detectWakeWord(interpreter: Interpreter, mfccFeatures: Array<Array<Array<FloatArray>>>): Boolean {
-        val outputShape = interpreter.getOutputTensor(0).shape()
-        val output = Array(outputShape[0]) { FloatArray(outputShape[1]) }
 
+
+    private fun detectWakeWord(
+        interpreter: Interpreter,
+        mfccFeatures: Array<Array<Array<FloatArray>>>
+    ): Boolean {
+        val output = Array(1) { FloatArray(1) }
         return try {
+            println("Input Features Shape: [${mfccFeatures.size}, ${mfccFeatures[0].size}, ${mfccFeatures[0][0].size}, ${mfccFeatures[0][0][0].size}]")
             interpreter.run(mfccFeatures, output)
-            output.any { it.maxOrNull() ?: 0f > 0.5f }
+            println("Model Output: ${output[0][0]}")
+            output[0][0] > THRESHOLD
         } catch (e: Exception) {
             println("Error during model inference: ${e.message}")
             false
         }
     }
+
+
+    private fun extractMFCC(audioBuffer: ShortArray): Array<Array<Array<FloatArray>>> {
+        // Normalize audio buffer to range [-1, 1]
+        val audioFloat = audioBuffer.map { it.toFloat() / Short.MAX_VALUE }
+
+        // Compute Mel spectrogram (2D array of shape [N_FRAMES, N_MELS])
+        val melSpectrogram = computeMelSpectrogram(audioFloat)
+
+        // Convert Mel spectrogram to 4D tensor [1, N_FRAMES, N_MELS, 1]
+        return arrayOf(
+            Array(N_FRAMES) { frameIndex ->
+                Array(N_MELS) { melIndex ->
+                    floatArrayOf(melSpectrogram[frameIndex][melIndex])
+                }
+            }
+        )
+    }
+
+
+    private fun computeMelSpectrogram(audio: List<Float>): Array<FloatArray> {
+        // Create an empty array to hold the Mel spectrogram
+        val melSpectrogram = Array(N_FRAMES) { FloatArray(N_MELS) }
+
+        // Fill the spectrogram with audio data, chunked into frames and Mel bins
+        for (i in 0 until N_FRAMES) {
+            for (j in 0 until N_MELS) {
+                val index = i * N_MELS + j
+                melSpectrogram[i][j] = if (index < audio.size) audio[index] else 0.0f
+            }
+        }
+
+        return melSpectrogram
+    }
+
+
+
 }
