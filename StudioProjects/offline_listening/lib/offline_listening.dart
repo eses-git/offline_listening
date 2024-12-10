@@ -3,6 +3,17 @@ import 'package:flutter/services.dart';
 class OfflineListening {
   static const MethodChannel _channel = MethodChannel('flutter_mfcc_plugin');
 
+  /// Initializes the callback handler for wake word detection.
+  /// This should be called once during initialization to set up the
+  /// listener for the "onWakeWordDetected" event.
+  static void initializeWakeWordCallback(Function onWakeWordDetected) {
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onWakeWordDetected') {
+        onWakeWordDetected();
+      }
+    });
+  }
+
   /// Checks if the TensorFlow Lite model is loaded correctly.
   /// Returns `true` if the model is loaded successfully, `false` otherwise.
   static Future<bool> isModelLoaded(String modelPath) async {
