@@ -17,7 +17,6 @@ allprojects {
     repositories {
         google()
         mavenCentral()
-        jcenter() // If you still need jcenter for other libraries
         maven { url 'https://jitpack.io' } // Ensure JitPack is available as fallback
     }
 }
@@ -32,6 +31,10 @@ android {
     defaultConfig {
         minSdk = 21
         targetSdk = 34 // Ensure the target SDK matches the compile SDK
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+        }
+
     }
 
     compileOptions {
@@ -46,7 +49,7 @@ android {
     sourceSets {
         main {
             java.srcDirs += "src/main/kotlin"
-            resources.srcDirs += "libs"
+        //    resources.srcDirs += "libs"
         }
     }
 
@@ -70,8 +73,8 @@ dependencies {
     //implementation 'org.tensorflow:tensorflow-lite-gpu:2.16.1'
 
     implementation 'org.bytedeco:tensorflow-lite:2.18.0-1.5.11'
-    implementation 'org.bytedeco:javacpp:1.5.11'
-
+  //  implementation 'org.bytedeco:javacpp:1.5.11'
+    implementation 'org.tensorflow:tensorflow-lite-metadata:0.4.4'
    // implementation 'org.bytedeco:tensorflow-lite:2.18.0-1.5.11'
     //
 
@@ -79,7 +82,8 @@ dependencies {
    // implementation 'com.github.rwl:jtransforms:2.4.0'
     implementation 'com.github.wendykierp:JTransforms:3.1'
 
-
+    implementation "androidx.core:core:1.9.0"
+    implementation "io.flutter:flutter_embedding_release:1.0.0"
 
     // Kotlin Standard Library
    // implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"

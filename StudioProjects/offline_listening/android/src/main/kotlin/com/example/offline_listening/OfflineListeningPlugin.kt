@@ -75,6 +75,18 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val file = File(modelPath)
         return file.exists()
     }
+    private fun validateInterpreter(interpreter: Interpreter) {
+        // Validate the first input tensor
+        val inputTensor = interpreter.input_tensor(0L)
+            ?: throw IllegalStateException("Input tensor at index 0 not found")
+        println("Input Tensor: Type=${inputTensor.type()}, Buffer=${inputTensor.data().capacity()} bytes")
+
+        // Validate the first output tensor
+        val outputTensor = interpreter.output_tensor(0L)
+            ?: throw IllegalStateException("Output tensor at index 0 not found")
+        println("Output Tensor: Type=${outputTensor.type()}, Buffer=${outputTensor.data().capacity()} bytes")
+    }
+
 
     private fun buildInterpreter(modelPath: String): Interpreter {
         val model = FlatBufferModel.BuildFromFile(modelPath)
@@ -84,6 +96,7 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val builder = InterpreterBuilder(model, BuiltinOpResolver())
         val result = builder.apply(interpreter)
         require(result == 0) { "Failed to build the interpreter. Error code: $result" }
+        validateInterpreter(interpreter) // Add this for debugging
 
         return interpreter
     }
@@ -162,7 +175,7 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             inputBuffer.put(features) // Write the input features into the buffer
 
             // Invoke the model
-            localInterpreter.invoke()
+            localInterpreter.Invoke()
 
             // Get output tensor (use `0L` for the output tensor index by default)
             val outputTensor = localInterpreter.output_tensor(0L)
