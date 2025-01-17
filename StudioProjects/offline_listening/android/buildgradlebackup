@@ -92,16 +92,9 @@ dependencies {
    // implementation 'org.tensorflow:tensorflow-lite:2.16.1'
    // implementation 'org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1'
     ///implementation 'org.tensorflow:tensorflow-lite-gpu:2.16.1'
-    implementation 'com.google.ai.edge.litert:litert:1.0.1'
-    implementation 'com.google.ai.edge.litert:litert-support:1.0.1'
 
-
-   // implementation 'org.apache.commons:commons-io:2.11.0'
-
-
-
-    //  implementation 'org.bytedeco:tensorflow-lite:2.18.0-1.5.11'
-  //  implementation 'org.bytedeco:tensorflow-lite-platform:2.18.0-1.5.11'
+    implementation 'org.bytedeco:tensorflow-lite:2.18.0-1.5.11'
+    implementation 'org.bytedeco:tensorflow-lite-platform:2.18.0-1.5.11'
 
     //  implementation 'org.bytedeco:javacpp:1.5.11'
     implementation 'org.tensorflow:tensorflow-lite-metadata:0.4.4'

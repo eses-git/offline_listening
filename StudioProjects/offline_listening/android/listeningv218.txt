@@ -1,0 +1,255 @@
+package com.example.offline_listening
+
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.bytedeco.tensorflowlite.FlatBufferModel
+import org.bytedeco.tensorflowlite.Interpreter
+import org.bytedeco.tensorflowlite.InterpreterBuilder
+import org.bytedeco.tensorflowlite.BuiltinOpResolver
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.io.File
+
+const val SAMPLE_RATE = 16000
+const val FRAME_RATE = 100
+const val FRAME_SIZE = SAMPLE_RATE / FRAME_RATE
+const val NUM_FEATURES = 40
+const val INPUT_SHAPE_BATCH = 1
+const val INPUT_SHAPE_TIME = 100
+const val INPUT_SHAPE_FEATURE = NUM_FEATURES
+const val INPUT_SHAPE_CHANNEL = 1
+const val BUFFER_SIZE = FRAME_SIZE * INPUT_SHAPE_TIME
+const val THRESHOLD = 0.5f
+
+class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
+    private lateinit var channel: MethodChannel
+    private var audioRecord: AudioRecord? = null
+    private var interpreter: Interpreter? = null
+    @Volatile
+    private var isListening = false
+
+    override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        println("onAttachedToEngine: Initializing plugin")
+        channel = MethodChannel(binding.binaryMessenger, "flutter_mfcc_plugin")
+        channel.setMethodCallHandler(this)
+        println("onAttachedToEngine: Plugin initialized successfully")
+    }
+
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        println("onDetachedFromEngine: Detaching plugin")
+        stopListening()
+        interpreter?.close()
+        interpreter = null
+        println("onDetachedFromEngine: Plugin detached successfully")
+    }
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        println("onMethodCall: Received method call - ${call.method}")
+        when (call.method) {
+            "isModelLoaded" -> {
+                val modelPath = call.argument<String>("modelPath")
+                println("onMethodCall: Checking if model is loaded - $modelPath")
+                result.success(modelPath?.let { isModelLoaded(it) } ?: false)
+            }
+            "startListening" -> {
+                val modelPath = call.argument<String>("modelPath")
+                println("onMethodCall: Starting listening with model - $modelPath")
+                if (!modelPath.isNullOrEmpty()) {
+                    CoroutineScope(Dispatchers.Main).launch {
+                        try {
+                            startListeningWithModel(modelPath)
+                            result.success("Listening started")
+                        } catch (e: Exception) {
+                            println("onMethodCall: Error starting listening - ${e.message}")
+                            stopListening()
+                            result.error("MODEL_LOADING_ERROR", "Failed to start listening: ${e.message}", e)
+                        }
+                    }
+                } else {
+                    result.error("INVALID_ARGUMENT", "Model path is null or invalid", null)
+                }
+            }
+            "stopListening" -> {
+                println("onMethodCall: Stopping listening")
+                stopListening()
+                result.success("Listening stopped")
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun isModelLoaded(modelPath: String): Boolean {
+        println("isModelLoaded: Checking if model exists at $modelPath")
+        val file = File(modelPath)
+        val exists = file.exists()
+        println("isModelLoaded: Model exists - $exists")
+        return exists
+    }
+
+    private fun buildInterpreter(modelPath: String): Interpreter {
+        println("buildInterpreter: Building interpreter for model at $modelPath")
+        val model = FlatBufferModel.BuildFromFile(modelPath)
+        require(!model.isNull) { "Failed to load model from $modelPath" }
+
+        val interpreter = Interpreter(null)
+        val builder = InterpreterBuilder(model, BuiltinOpResolver())
+        val result = builder.apply(interpreter)
+        require(result == 0) { "Failed to build the interpreter. Error code: $result" }
+
+        println("buildInterpreter: Interpreter built successfully")
+        return interpreter
+    }
+
+    private fun startListeningWithModel(modelPath: String) {
+        println("startListeningWithModel: Initializing interpreter and AudioRecord")
+        interpreter = buildInterpreter(modelPath)
+
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        println("startListeningWithModel: Min buffer size - $minBufferSize")
+        require(minBufferSize != AudioRecord.ERROR && minBufferSize != AudioRecord.ERROR_BAD_VALUE) {
+            "AudioRecord configuration is not supported on this device"
+        }
+
+        audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            BUFFER_SIZE
+        )
+        require(audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+            "Failed to initialize AudioRecord"
+        }
+
+        println("startListeningWithModel: AudioRecord initialized successfully")
+        isListening = true
+        audioRecord?.startRecording()
+        println("startListeningWithModel: Audio recording started")
+
+        CoroutineScope(Dispatchers.IO).launch {
+            processAudio()
+        }
+    }
+
+    private suspend fun processAudio() {
+        val audioBuffer = ShortArray(BUFFER_SIZE)
+        println("processAudio: Starting audio processing")
+        try {
+            while (isListening) {
+                val read = audioRecord?.read(audioBuffer, 0, audioBuffer.size) ?: 0
+                println("processAudio: Read $read bytes from AudioRecord")
+                if (read > 0) {
+                    val inputBuffer = prepareInput(audioBuffer)
+                    println("processAudio: Prepared input buffer")
+                    val detected = detectWakeWord(inputBuffer)
+                    if (detected) {
+                        println("processAudio: Wake Word detected!")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            println("processAudio: Error during audio processing - ${e.message}")
+            e.printStackTrace()
+        }
+    }
+
+    private fun prepareInput(audioBuffer: ShortArray): ByteBuffer {
+        println("prepareInput: Preparing input buffer from audio data")
+        val inputBuffer = ByteBuffer.allocateDirect(BUFFER_SIZE * 4)
+        inputBuffer.order(ByteOrder.nativeOrder())
+
+        val normalizedAudio = audioBuffer.map { it / Short.MAX_VALUE.toFloat() }
+        normalizedAudio.forEach { inputBuffer.putFloat(it) }
+
+        inputBuffer.rewind()
+        println("prepareInput: Input buffer prepared successfully")
+        return inputBuffer
+    }
+
+    private fun detectWakeWord(inputBuffer: ByteBuffer): Boolean {
+        println("detectWakeWord: Preparing for inference")
+
+        return try {
+            val localInterpreter = interpreter ?: throw IllegalStateException("Interpreter is not initialized")
+
+            // Validate input tensor
+            val inputTensor = localInterpreter.inputs()
+            if (inputTensor.isNull) {
+                throw IllegalStateException("Input tensor memory allocation failed")
+            }
+            val inputCapacity = inputTensor.capacity().toInt() // Convert Long to Int
+            println("detectWakeWord: Input tensor memory capacity - $inputCapacity bytes")
+
+            // Validate input size
+            require(inputCapacity == inputBuffer.remaining()) {
+                "Input buffer size (${inputBuffer.remaining()}) does not match input tensor size ($inputCapacity)"
+            }
+
+            // Copy input data
+            inputBuffer.position(0) // Reset the position to the start
+            for (i in 0 until inputBuffer.remaining()) {
+                inputTensor.put(i.toLong(), inputBuffer.get(i).toInt() and 0xFF) // Convert Byte to Int
+            }
+
+            // Run inference
+            println("detectWakeWord: Running inference")
+            val invokeResult = localInterpreter.Invoke()
+            if (invokeResult != 0) { // Ensure comparison with Int
+                throw IllegalStateException("Interpreter Invoke failed with result code: $invokeResult")
+            }
+
+            // Validate output tensor
+            val outputTensor = localInterpreter.outputs()
+            if (outputTensor.isNull) {
+                throw IllegalStateException("Output tensor memory allocation failed")
+            }
+            val outputCapacity = outputTensor.capacity().toInt() // Convert Long to Int
+            println("detectWakeWord: Output tensor memory capacity - $outputCapacity bytes")
+
+            // Allocate a ByteBuffer for the output
+            val outputBuffer = ByteBuffer.allocateDirect(outputCapacity)
+            outputBuffer.order(ByteOrder.nativeOrder())
+
+            // Extract output tensor data into the ByteBuffer
+            for (i in 0 until outputCapacity) {
+                outputBuffer.put(i, outputTensor.get(i.toLong()).toByte())
+            }
+
+            // Read the output value
+            outputBuffer.position(0)
+            val outputValue = outputBuffer.float
+            println("detectWakeWord: Model Output - $outputValue")
+
+            // Return detection result
+            return outputValue > THRESHOLD
+        } catch (e: Exception) {
+            println("detectWakeWord: Error during inference - ${e.message}")
+            e.printStackTrace()
+            false
+        }
+    }
+
+
+
+
+
+    private fun stopListening() {
+        println("stopListening: Stopping audio recording")
+        isListening = false
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+        println("stopListening: Audio recording stopped")
+    }
+}

@@ -1,0 +1,229 @@
+package com.example.offline_listening
+
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.bytedeco.tensorflowlite.*
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.ArrayDeque
+
+const val SAMPLE_RATE = 16000
+const val FRAME_RATE = 100
+const val FRAME_SIZE = SAMPLE_RATE / FRAME_RATE
+const val BUFFER_SIZE = FRAME_SIZE * FRAME_RATE
+const val MEL_BANDS = 40
+const val THRESHOLD = 0.5f
+const val N_FRAMES = BUFFER_SIZE / FRAME_SIZE
+
+class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
+    private lateinit var channel: MethodChannel
+    private var audioRecord: AudioRecord? = null
+    @Volatile
+    private var isListening = false
+    private var interpreter: Interpreter? = null
+    private lateinit var inputBuffer: ByteBuffer
+    private lateinit var outputBuffer: ByteBuffer
+
+    override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        channel = MethodChannel(binding.binaryMessenger, "flutter_mfcc_plugin")
+        channel.setMethodCallHandler(this)
+    }
+
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        stopListening()
+        interpreter?.close()
+        interpreter = null
+    }
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "isModelLoaded" -> {
+                val modelPath = call.argument<String>("modelPath")
+                result.success(modelPath?.let { isModelLoaded(it) } ?: false)
+            }
+            "startListening" -> {
+                val modelPath = call.argument<String>("modelPath")
+                if (!modelPath.isNullOrEmpty()) {
+                    CoroutineScope(Dispatchers.Main).launch {
+                        try {
+                            startListeningWithModel(modelPath)
+                            result.success("Listening started")
+                        } catch (e: Exception) {
+                            stopListening()
+                            result.error("MODEL_LOADING_ERROR", "Failed to start listening: ${e.message}", e)
+                        }
+                    }
+                } else {
+                    result.error("INVALID_ARGUMENT", "Model path is null or invalid", null)
+                }
+            }
+            "stopListening" -> {
+                stopListening()
+                result.success("Listening stopped")
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun isModelLoaded(modelPath: String): Boolean {
+        val file = File(modelPath)
+        return file.exists()
+    }
+
+    private fun buildInterpreter(modelPath: String): Interpreter {
+        val model = FlatBufferModel.BuildFromFile(modelPath)
+        require(!model.isNull) { "Failed to load model from $modelPath" }
+
+        val interpreter = Interpreter(null)
+        val builder = InterpreterBuilder(model, BuiltinOpResolver())
+        val result = builder.apply(interpreter)
+        require(result == 0) { "Failed to build the interpreter. Error code: $result" }
+
+        initializeBuffers(interpreter)
+        return interpreter
+    }
+
+    private fun initializeBuffers(interpreter: Interpreter) {
+        val inputTensor = interpreter.input_tensor(0) // Use 0 as Int
+            ?: throw IllegalStateException("Input tensor not found")
+
+        inputBuffer = ByteBuffer.allocateDirect(inputTensor.data().capacity().toInt()).order(ByteOrder.nativeOrder())
+
+        val outputTensor = interpreter.output_tensor(0) // Use 0 as Int
+            ?: throw IllegalStateException("Output tensor not found")
+
+        outputBuffer = ByteBuffer.allocateDirect(outputTensor.data().capacity().toInt()).order(ByteOrder.nativeOrder())
+    }
+
+
+
+    private fun startListeningWithModel(modelPath: String) {
+        interpreter = buildInterpreter(modelPath)
+
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBufferSize == AudioRecord.ERROR_BAD_VALUE || minBufferSize == AudioRecord.ERROR) {
+            throw IllegalStateException("Invalid AudioRecord buffer size")
+        }
+
+        audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            minBufferSize
+        )
+
+        isListening = true
+        audioRecord?.startRecording()
+
+        CoroutineScope(Dispatchers.IO).launch {
+            processAudio()
+        }
+    }
+
+    private suspend fun processAudio() {
+        val audioBuffer = ShortArray(FRAME_SIZE)
+        val slidingWindow = ArrayDeque<Float>()
+
+        try {
+            while (isListening) {
+                val read = audioRecord?.read(audioBuffer, 0, audioBuffer.size) ?: 0
+                if (read > 0) {
+                    val normalizedAudio = audioBuffer.take(read).map { it / Short.MAX_VALUE.toFloat() }
+                    addToSlidingWindow(normalizedAudio, slidingWindow)
+
+                    if (slidingWindow.size >= BUFFER_SIZE) {
+                        val inputFeatures = prepareInput(slidingWindow)
+                        if (detectWakeWord(inputFeatures)) {
+                            channel.invokeMethod("onWakeWordDetected", null)
+                        }
+
+                        // Remove processed frames
+                        repeat(FRAME_SIZE) { if (slidingWindow.isNotEmpty()) slidingWindow.removeFirst() }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            println("Error during audio processing: ${e.message}")
+        }
+    }
+
+    private fun addToSlidingWindow(normalizedAudio: List<Float>, slidingWindow: ArrayDeque<Float>) {
+        while (slidingWindow.size + normalizedAudio.size > BUFFER_SIZE) {
+            slidingWindow.removeFirst()
+        }
+        slidingWindow.addAll(normalizedAudio)
+    }
+
+    private fun detectWakeWord(features: FloatArray): Boolean {
+        if (features.size != (N_FRAMES * MEL_BANDS)) {
+            println("Invalid input features size: ${features.size}, expected: ${N_FRAMES * MEL_BANDS}")
+            return false
+        }
+
+        val output = FloatArray(1)
+        return try {
+            val localInterpreter = interpreter ?: throw IllegalStateException("Interpreter is not initialized")
+
+            // Get the input tensor and validate its dimensions
+            val inputTensor = localInterpreter.input_tensor(0L)
+                ?: throw IllegalStateException("Input tensor at index 0 not found")
+
+            val inputBuffer = inputTensor.data().asByteBuffer().asFloatBuffer()
+            inputBuffer.rewind()
+
+            // Reshape the features into the expected format
+            val reshapedFeatures = FloatArray(N_FRAMES * MEL_BANDS) // Adjust the size to match expected input
+            features.copyInto(reshapedFeatures)
+            inputBuffer.put(reshapedFeatures)
+
+            // Invoke the model
+            localInterpreter.Invoke()
+
+            // Get the output tensor and validate
+            val outputTensor = localInterpreter.output_tensor(0L)
+                ?: throw IllegalStateException("Output tensor at index 0 not found")
+            val outputBuffer = outputTensor.data().asByteBuffer().asFloatBuffer()
+            outputBuffer.rewind()
+            outputBuffer.get(output)
+
+            println("Model Output: ${output[0]}")
+            output[0] > THRESHOLD
+        } catch (e: Exception) {
+            println("Error during inference: ${e.message}")
+            false
+        }
+    }
+
+
+    private fun prepareInput(slidingWindow: ArrayDeque<Float>): FloatArray {
+        if (slidingWindow.size < BUFFER_SIZE) {
+            println("Insufficient data in sliding window")
+            return FloatArray(0)
+        }
+
+        // Replace with actual Mel spectrogram computation
+        val melSpectrogram = FloatArray(N_FRAMES * MEL_BANDS)
+        // Implement the Mel spectrogram logic here
+        return melSpectrogram
+    }
+
+    private fun stopListening() {
+        isListening = false
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+    }
+}
