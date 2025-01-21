@@ -9,11 +9,11 @@ import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import org.bytedeco.tensorflowlite.FlatBufferModel
-import org.bytedeco.tensorflowlite.Interpreter
-import org.bytedeco.tensorflowlite.InterpreterBuilder
-import org.bytedeco.tensorflowlite.BuiltinOpResolver
+import org.tensorflow.lite.Interpreter
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 
 const val SAMPLE_RATE = 16000
 const val FRAME_RATE = 100
@@ -28,11 +28,6 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     @Volatile
     private var isListening = false
     private var interpreter: Interpreter? = null
-
-    init {
-        // Load the TensorFlow Lite library
-        System.loadLibrary("jnitensorflowlite")
-    }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(binding.binaryMessenger, "flutter_mfcc_plugin")
@@ -80,35 +75,14 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         return file.exists()
     }
 
-    private fun validateInterpreter(interpreter: Interpreter) {
-        val inputTensor = interpreter.input_tensor(0L)
-            ?: throw IllegalStateException("Input tensor at index 0 not found")
-        println("Input Tensor: Type=${inputTensor.type()}, Buffer=${inputTensor.data().capacity()} bytes")
-
-        val outputTensor = interpreter.output_tensor(0L)
-            ?: throw IllegalStateException("Output tensor at index 0 not found")
-        println("Output Tensor: Type=${outputTensor.type()}, Buffer=${outputTensor.data().capacity()} bytes")
-    }
-
-    private fun buildInterpreter(modelPath: String): Interpreter {
-        val model = FlatBufferModel.BuildFromFile(modelPath)
-        require(!model.isNull) { "Failed to load model from $modelPath" }
-
-        // Initialize Interpreter with default constructor
-        val interpreter = Interpreter(null)
-
-        // Now load the model into the interpreter using InterpreterBuilder
-        val builder = InterpreterBuilder(model, BuiltinOpResolver())
-        val result = builder.apply(interpreter)
-        require(result == 0) { "Failed to build the interpreter. Error code: $result" }
-
-        validateInterpreter(interpreter)
-
-        return interpreter
+    private fun loadModel(modelPath: String): Interpreter {
+        val modelFile = File(modelPath)
+        require(modelFile.exists()) { "Model file not found at $modelPath" }
+        return Interpreter(modelFile)
     }
 
     private fun startListeningWithModel(modelPath: String) {
-        interpreter = buildInterpreter(modelPath)
+        interpreter = loadModel(modelPath)
 
         val minBufferSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
@@ -152,6 +126,7 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                         val features = prepareInput(frame)
                         if (detectWakeWord(features)) {
                             println("Wake Word detected!")
+                            // Trigger an action when the wake word is detected
                         }
                     }
                 }
@@ -176,25 +151,23 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
         val output = FloatArray(1)
         return try {
-            val localInterpreter = interpreter ?: throw IllegalStateException("Interpreter is not initialized")
-            val inputTensor = localInterpreter.input_tensor(0L)
-                ?: throw IllegalStateException("Input tensor at index 0 not found")
+            // Prepare input buffer
+            val inputBuffer = ByteBuffer.allocateDirect(features.size * 4).apply {
+                order(ByteOrder.nativeOrder())
+                asFloatBuffer().put(features)
+            }
 
-            val inputBuffer = inputTensor.data().asByteBuffer().asFloatBuffer()
-            inputBuffer.rewind()
+            // Prepare output buffer
+            val outputBuffer = ByteBuffer.allocateDirect(output.size * 4).apply {
+                order(ByteOrder.nativeOrder())
+            }
 
-            val reshapedFeatures = FloatArray(FRAME_SIZE)
-            features.copyInto(reshapedFeatures, endIndex = FRAME_SIZE.coerceAtMost(features.size))
-            inputBuffer.put(reshapedFeatures)
+            // Run inference
+            interpreter?.run(inputBuffer, outputBuffer)
 
-            localInterpreter.Invoke()
-
-            val outputTensor = localInterpreter.output_tensor(0L)
-                ?: throw IllegalStateException("Output tensor at index 0 not found")
-            val outputBuffer = outputTensor.data().asByteBuffer().asFloatBuffer()
+            // Extract output
             outputBuffer.rewind()
-            outputBuffer.get(output)
-
+            outputBuffer.asFloatBuffer().get(output)
             println("Model Output: ${output[0]}")
             output[0] > THRESHOLD
         } catch (e: Exception) {

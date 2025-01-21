@@ -6,21 +6,20 @@ import android.media.MediaRecorder
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.FloatBuffer
+import kotlin.math.*
 
 const val SAMPLE_RATE = 16000
-const val FRAME_RATE = 100
-const val FRAME_SIZE = SAMPLE_RATE / FRAME_RATE
-const val N_FRAMES = 100
-const val BUFFER_SIZE = FRAME_SIZE * N_FRAMES
-const val THRESHOLD = 0.5f
+const val FRAME_SIZE = SAMPLE_RATE / 200  // Frame size based on frame rate
+const val HOP_SIZE = FRAME_SIZE / 2      // 50% overlap for sliding window
+const val N_FRAMES = 256                 // Number of frames for 1-second clip
+const val REQUIRED_SAMPLES = FRAME_SIZE * (N_FRAMES - 1) + FRAME_SIZE // Total samples
+const val MEL_BANDS = 300                // Mel bands, matching training code
+const val THRESHOLD = 0.95f               // Threshold for classification
 
 class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var channel: MethodChannel
@@ -28,6 +27,8 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     @Volatile
     private var isListening = false
     private var interpreter: Interpreter? = null
+
+    private val audioBuffer = ArrayList<Short>()
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(binding.binaryMessenger, "flutter_mfcc_plugin")
@@ -71,8 +72,7 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     private fun isModelLoaded(modelPath: String): Boolean {
-        val file = File(modelPath)
-        return file.exists()
+        return File(modelPath).exists()
     }
 
     private fun loadModel(modelPath: String): Interpreter {
@@ -98,7 +98,7 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            BUFFER_SIZE
+            REQUIRED_SAMPLES
         )
         require(audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
             "Failed to initialize AudioRecord"
@@ -113,26 +113,127 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     private suspend fun processAudio() {
-        val audioBuffer = ShortArray(BUFFER_SIZE)
-        val slidingWindow = ArrayDeque<Short>()
+        val tempBuffer = ShortArray(FRAME_SIZE)
         try {
             while (isListening) {
-                val read = audioRecord?.read(audioBuffer, 0, audioBuffer.size) ?: 0
+                val read = audioRecord?.read(tempBuffer, 0, FRAME_SIZE) ?: 0
                 if (read > 0) {
-                    slidingWindow.addAll(audioBuffer.take(read))
-                    if (slidingWindow.size >= BUFFER_SIZE) {
-                        val frame = slidingWindow.take(BUFFER_SIZE).toShortArray()
-                        repeat(BUFFER_SIZE) { if (slidingWindow.isNotEmpty()) slidingWindow.removeFirst() }
-                        val features = prepareInput(frame)
-                        if (detectWakeWord(features)) {
-                            println("Wake Word detected!")
-                            // Trigger an action when the wake word is detected
+                    synchronized(audioBuffer) {
+                        if (audioBuffer.size > REQUIRED_SAMPLES) {
+                            audioBuffer.subList(0, audioBuffer.size - REQUIRED_SAMPLES).clear()
+                        }
+                        audioBuffer.addAll(tempBuffer.take(read))
+                        if (audioBuffer.size >= REQUIRED_SAMPLES) {
+                            val frame = synchronized(audioBuffer) {
+                                audioBuffer.take(REQUIRED_SAMPLES).toShortArray()
+                            }
+                            synchronized(audioBuffer) {
+                                audioBuffer.subList(0, HOP_SIZE).clear()
+                            }
+
+                            // Debugging: Log raw audio frame
+                            android.util.Log.d("OfflineListening", "Raw audio frame: ${frame.joinToString(", ")}")
+
+                            val windowedFrame = applyWindowing(frame)
+
+                            // Debugging: Log windowed frame
+                            android.util.Log.d("OfflineListening", "Windowed audio frame: ${windowedFrame.joinToString(", ")}")
+
+                            val inputTensor = preprocessAudioToShort(windowedFrame)
+
+                            // Debugging: Log input tensor after preprocessing
+                            android.util.Log.d("OfflineListening", "Input tensor after preprocessing: ${inputTensor.joinToString(", ")}")
+
+                            val output = classifyWakeWord(inputTensor)
+
+                            // Debugging: Log model output
+                            android.util.Log.d("OfflineListening", "Model output: $output")
+
+                            if (output > THRESHOLD) {
+                                // Wake word detected, log the event
+                                android.util.Log.d("OfflineListening", "Wake word detected with output: $output")
+                                CoroutineScope(Dispatchers.Main).launch {
+                                    channel.invokeMethod("onWakeWordDetected", null)
+                                }
+                            } else {
+                                // Debugging: Log when no wake word is recognized
+                                android.util.Log.d("OfflineListening", "Wake word not recognized. Output below threshold.")
+                            }
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            println("Error during audio processing: ${e.message}")
+            e.printStackTrace()
+        }
+    }
+
+    private fun preprocessAudio(audioFrame: ShortArray): FloatArray {
+        val floatAudioFrame = audioFrame.map { it.toFloat() / Short.MAX_VALUE }.toFloatArray()
+
+        // Debugging: Log the raw audio frame after conversion to float
+        android.util.Log.d("OfflineListening", "Float audio frame: ${floatAudioFrame.joinToString(", ")}")
+
+        val requiredSize = 19200
+        return if (floatAudioFrame.size > requiredSize) {
+            floatAudioFrame.sliceArray(0 until requiredSize)
+        } else {
+            FloatArray(requiredSize).apply {
+                floatAudioFrame.copyInto(this)
+            }
+        }
+    }
+
+    private fun preprocessAudioToShort(audioFrame: ShortArray): FloatArray {
+        val floatAudioFrame = audioFrame.map { it.toFloat() / Short.MAX_VALUE }.toFloatArray()
+
+        // Debugging: Log the float audio frame
+        android.util.Log.d("OfflineListening", "Processed float audio frame: ${floatAudioFrame.joinToString(", ")}")
+
+        val requiredSize = 19200
+        return if (floatAudioFrame.size > requiredSize) {
+            floatAudioFrame.sliceArray(0 until requiredSize)
+        } else {
+            FloatArray(requiredSize).apply {
+                floatAudioFrame.copyInto(this)
+            }
+        }
+    }
+
+    private fun applyWindowing(frame: ShortArray): ShortArray {
+        val windowedFrame = ShortArray(frame.size)
+        for (i in frame.indices) {
+            // Applying Hamming window
+            windowedFrame[i] = (frame[i] * (0.54 - 0.46 * cos(2 * PI * i / (frame.size - 1)))).toInt().toShort()  // Fixing toInt() and then toShort()
+        }
+
+        // Debugging: Log windowed frame
+        android.util.Log.d("OfflineListening", "Windowed frame: ${windowedFrame.joinToString(", ")}")
+
+        return windowedFrame
+    }
+
+
+    private fun classifyWakeWord(inputTensor: FloatArray): Float {
+        val expectedSize = 19200
+        if (inputTensor.size != expectedSize) {
+            throw IllegalArgumentException("Input tensor size mismatch. Expected $expectedSize, but got ${inputTensor.size}")
+        }
+
+        val inputBuffer = ByteBuffer.allocateDirect(expectedSize * 4)
+            .order(ByteOrder.nativeOrder())
+        inputBuffer.asFloatBuffer().put(inputTensor)
+
+        val outputSize = interpreter?.getOutputTensor(0)?.numElements() ?: 1
+        val outputBuffer = ByteBuffer.allocateDirect(outputSize * 4).order(ByteOrder.nativeOrder())
+
+        interpreter?.run(inputBuffer, outputBuffer)
+        outputBuffer.rewind()
+
+        return if (outputBuffer.remaining() >= 4) {
+            outputBuffer.float
+        } else {
+            throw IllegalStateException("Output buffer is smaller than expected!")
         }
     }
 
@@ -141,42 +242,5 @@ class OfflineListeningPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         audioRecord?.stop()
         audioRecord?.release()
         audioRecord = null
-    }
-
-    private fun detectWakeWord(features: FloatArray): Boolean {
-        if (features.size != FRAME_SIZE) {
-            println("Invalid input features size: ${features.size}, expected: $FRAME_SIZE")
-            return false
-        }
-
-        val output = FloatArray(1)
-        return try {
-            // Prepare input buffer
-            val inputBuffer = ByteBuffer.allocateDirect(features.size * 4).apply {
-                order(ByteOrder.nativeOrder())
-                asFloatBuffer().put(features)
-            }
-
-            // Prepare output buffer
-            val outputBuffer = ByteBuffer.allocateDirect(output.size * 4).apply {
-                order(ByteOrder.nativeOrder())
-            }
-
-            // Run inference
-            interpreter?.run(inputBuffer, outputBuffer)
-
-            // Extract output
-            outputBuffer.rewind()
-            outputBuffer.asFloatBuffer().get(output)
-            println("Model Output: ${output[0]}")
-            output[0] > THRESHOLD
-        } catch (e: Exception) {
-            println("Error during inference: ${e.message}")
-            false
-        }
-    }
-
-    private fun prepareInput(audioBuffer: ShortArray): FloatArray {
-        return audioBuffer.map { it / Short.MAX_VALUE.toFloat() }.toFloatArray()
     }
 }

@@ -6,6 +6,7 @@ buildscript {
     repositories {
         google()
         mavenCentral() // Ensure Maven Central is included
+        jcenter()
     }
     dependencies {
         classpath("com.android.tools.build:gradle:8.4.0") // Gradle plugin version for Gradle 8.4
@@ -94,9 +95,16 @@ dependencies {
     ///implementation 'org.tensorflow:tensorflow-lite-gpu:2.16.1'
     implementation 'com.google.ai.edge.litert:litert:1.0.1'
     implementation 'com.google.ai.edge.litert:litert-support:1.0.1'
+    implementation('com.litongjava:jlibrosa:1.1.8') {
+        exclude group: 'junit', module: 'junit'
+        exclude group: 'org.hamcrest', module: 'hamcrest-core'
+    }
 
 
-   // implementation 'org.apache.commons:commons-io:2.11.0'
+
+
+
+    // implementation 'org.apache.commons:commons-io:2.11.0'
 
 
 
